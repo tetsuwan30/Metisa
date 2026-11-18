@@ -1,5 +1,5 @@
 # Metisa
-Metisa is Web Apps for collaboration work
+Metisa is Web Apps for collaboration work.
 
 
 ## wiki
