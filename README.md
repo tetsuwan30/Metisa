@@ -116,15 +116,15 @@ Google アカウントでログインして利用する、階層型の Wiki
 
 ## 動作環境・技術
 
-  項目              使用技術
-  ----------------- -----------------------------------
-  バックエンド      Ruby 2.6
-  実行方式          CGI
-  フロントエンド    HTML / CSS / JavaScript
-  認証              Google OAuth 2.0 / OpenID Connect
-  データ保存        ファイルベース
-  設定ファイル      JSON
-  Ruby ライブラリ   Ruby 標準ライブラリ
+| 項目 | 使用技術 |
+|---|---|
+| バックエンド | Ruby 2.6 |
+| 実行方式 | CGI |
+| フロントエンド | HTML / CSS / JavaScript |
+| 認証 | Google OAuth 2.0 / OpenID Connect |
+| データ保存 | ファイルベース |
+| 設定ファイル | JSON |
+| Ruby ライブラリ | Ruby 標準ライブラリ |
 
 Ruby CGI が利用できる一般的なレンタルサーバーでの動作を想定しています。
 開発・設置環境の一つとして、ロリポップ！レンタルサーバーを使用しています。
@@ -179,14 +179,14 @@ URL を登録します。
 }
 ```
 
-  設定項目                 説明
-  ------------------------ ----------------------------------------
-  `google_client_id`       Google OAuth クライアント ID
-  `google_client_secret`   Google OAuth クライアントシークレット
-  `redirect_uri`           OAuth 認証後の戻り先 URL
-  `session_secret`         セッション署名に使用する秘密鍵
-  `allowed_emails`         アクセスを許可するメールアドレスの配列
-  `permalink_base`         ページリンクのベース URL
+| 設定項目 | 説明 |
+|---|---|
+| `google_client_id` | Google OAuth クライアント ID |
+| `google_client_secret` | Google OAuth クライアントシークレット |
+| `redirect_uri` | OAuth 認証後の戻り先 URL |
+| `session_secret` | セッション署名に使用する秘密鍵 |
+| `allowed_emails` | アクセスを許可するメールアドレスの配列 |
+| `permalink_base` | ページリンクのベース URL |
 
 `permalink_base` は省略できます。省略した場合は `index.cgi?id=ページID`
 形式の URL を使用します。
