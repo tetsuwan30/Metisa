@@ -616,8 +616,31 @@ PAGE = <<~'HTML'
   body { margin: 0; display: flex; flex-direction: column; font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; background: #f2f3f5; color: #222; }
 
   header { flex: none; background: #2f3640; color: #fff; padding: 8px 14px; font-weight: bold; display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
-  header .user { font-weight: normal; font-size: 13px; }
-  header a { color: #fff; }
+  header .appbtn { display: flex; align-items: center; justify-content: center; width: 36px; height: 32px; padding: 0; background: transparent;
+    color: #fff; border: 1px solid #667; border-radius: 6px; cursor: pointer; }
+  header .appbtn:hover, header .appbtn[aria-expanded="true"] { background: rgba(255,255,255,.14); }
+  header .appbtn svg { width: 18px; height: 18px; fill: currentColor; }
+  /* 右からスライドして出るメニュー */
+  #appmenu-backdrop { position: fixed; inset: 0; z-index: 55; background: rgba(20,24,32,.4); opacity: 0; visibility: hidden;
+    transition: opacity .22s ease, visibility 0s .22s; }
+  #appmenu-backdrop.open { opacity: 1; visibility: visible; transition: opacity .22s ease; }
+  #appmenu { position: fixed; top: 0; right: 0; bottom: 0; z-index: 60; width: min(300px, 86vw);
+    display: flex; flex-direction: column; background: #fff; color: #222; font-weight: normal;
+    box-shadow: -4px 0 18px rgba(0,0,0,.22); transform: translateX(100%); visibility: hidden;
+    transition: transform .22s ease, visibility 0s .22s; padding-bottom: env(safe-area-inset-bottom); }
+  #appmenu.open { transform: translateX(0); visibility: visible; transition: transform .22s ease; }
+  @media (prefers-reduced-motion: reduce) { #appmenu, #appmenu-backdrop { transition: none !important; } }
+  #appmenu .am-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px 12px 18px;
+    background: #2f3640; color: #fff; font-weight: bold; }
+  #appmenu .am-head button { font: inherit; background: transparent; color: #fff; border: 1px solid #667; border-radius: 6px;
+    width: 32px; height: 30px; cursor: pointer; }
+  #appmenu .am-item { display: block; padding: 14px 18px; color: #222; text-decoration: none; font-size: 15px;
+    border-left: 4px solid transparent; }
+  #appmenu .am-item:hover, #appmenu .am-item:focus-visible { background: #f1f3f6; outline: none; }
+  #appmenu .am-item.cur { border-left-color: #2f6fed; background: #eef3ff; font-weight: bold; }
+  #appmenu .am-sep { height: 1px; background: #e2e5ea; margin: 8px 0; }
+  #appmenu .am-user { padding: 6px 18px; font-size: 12px; color: #667; word-break: break-all; }
+  #appmenu .am-out { color: #b3261e; }
   header .menu { font: inherit; background: transparent; color: #fff; border: 1px solid #667; border-radius: 4px; padding: 2px 8px; cursor: pointer; margin-right: 6px; }
   #status { font-weight: normal; font-size: 13px; color: #cfe0ff; }
   #status.err { color: #ffb4ab; }
@@ -738,8 +761,24 @@ PAGE = <<~'HTML'
 <header>
   <span><button id="menu" class="menu" title="チケット一覧の表示／非表示">☰</button>Ticket</span>
   <span id="status"></span>
-  <span class="user">{{EMAIL}} ・ <a href="{{SCRIPT_HTML}}?action=logout">ログアウト</a></span>
+  <button id="appmenuBtn" class="appbtn" type="button" aria-label="アプリメニューを開く" aria-haspopup="true"
+          aria-expanded="false" aria-controls="appmenu" title="アプリの切り替え・ログアウト">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="5" r="2"/><circle cx="12" cy="5" r="2"/><circle cx="19" cy="5" r="2"/>
+      <circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/>
+      <circle cx="5" cy="19" r="2"/><circle cx="12" cy="19" r="2"/><circle cx="19" cy="19" r="2"/></svg>
+  </button>
 </header>
+
+<div id="appmenu-backdrop"></div>
+<nav id="appmenu" aria-label="アプリメニュー">
+  <div class="am-head"><span>メニュー</span><button id="appmenuClose" type="button" aria-label="閉じる">✕</button></div>
+  <a class="am-item" href="/wiki/">Wiki</a>
+  <a class="am-item cur" href="/ticket/" aria-current="page">チケット管理</a>
+  <a class="am-item" href="/board/">ホワイトボード</a>
+  <div class="am-sep"></div>
+  <div class="am-user">{{EMAIL}}</div>
+  <a class="am-item am-out" href="{{SCRIPT_HTML}}?action=logout">ログアウト</a>
+</nav>
 
 <div class="layout">
   <aside id="sidebar">
@@ -1103,7 +1142,10 @@ PAGE = <<~'HTML'
   }
   function syncUrl(id, how = 'push') {
     if (how === 'none') return;
-    const u = id ? ep + '?id=' + encodeURIComponent(id) : ep;
+    // permalink_base があれば /ticket/WEB-1 の形、なければ index.cgi?id=WEB-1 の形をアドレスバーに出す
+    const u = PERMA_BASE
+      ? new URL(id ? PERMA_BASE + id : PERMA_BASE, location.origin).pathname
+      : (id ? ep + '?id=' + encodeURIComponent(id) : ep);
     if (location.pathname + location.search === u) return;
     history[how === 'replace' ? 'replaceState' : 'pushState'](null, '', u);
   }
@@ -1121,6 +1163,7 @@ PAGE = <<~'HTML'
 
   function showHome(urlHow = 'push') {
     cur = null; dirty = false;
+    document.title = 'Ticket';
     $('detail').hidden = true; $('home').hidden = false;
     setMode('view');
     syncUrl('', urlHow);
@@ -1154,6 +1197,7 @@ PAGE = <<~'HTML'
   function renderDetail(keepEdit = false) {
     const c = cur, isNew = !c.id;
     $('home').hidden = true; $('detail').hidden = false;
+    document.title = isNew ? '新規チケット - Ticket' : `${c.id} ${c.title} - Ticket`;
     $('dId').textContent = isNew ? `新規チケット（${c.project}）` : c.id;
     $('vTitle').textContent = c.title || '（タイトル未設定）';
     if (c.description) linkify($('vDesc'), c.description); else $('vDesc').replaceChildren(el('span', { class: 'placeholder', text: '説明はありません' }));
@@ -1355,6 +1399,30 @@ PAGE = <<~'HTML'
       msg('プロジェクトを保存しました');
     } catch (e) { msg(e.message, true); }
   }
+
+  // ---------- アプリメニュー（右上のボタン。右からスライドして出る） ----------
+
+  const appBtn = $('appmenuBtn'), appMenu = $('appmenu'), appBackdrop = $('appmenu-backdrop');
+  const appFocusable = () => Array.from(appMenu.querySelectorAll('a[href], button'));
+  function setAppMenu(open) {
+    appMenu.classList.toggle('open', open);
+    appBackdrop.classList.toggle('open', open);
+    appBtn.setAttribute('aria-expanded', String(open));
+    appBtn.setAttribute('aria-label', open ? 'アプリメニューを閉じる' : 'アプリメニューを開く');
+    if (open) appFocusable()[1].focus(); else appBtn.focus();
+  }
+  appBtn.addEventListener('click', () => setAppMenu(!appMenu.classList.contains('open')));
+  $('appmenuClose').addEventListener('click', () => setAppMenu(false));
+  appBackdrop.addEventListener('click', () => setAppMenu(false));
+  document.addEventListener('keydown', e => {
+    if (!appMenu.classList.contains('open')) return;
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setAppMenu(false); return; }
+    if (e.key === 'Tab') {   // メニューの中だけで Tab を回す
+      const f = appFocusable(), first = f[0], last = f[f.length - 1];
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    }
+  }, true);
 
   // ---------- イベント ----------
 
