@@ -1,16 +1,16 @@
 #!/usr/local/bin/ruby2.6
 # coding: utf-8
 #
-# Papyru（WYSIWYG エディタ）— Googleアカウントログイン付き
+# wiki（WYSIWYG エディタ）— Googleアカウントログイン付き
 # ロリポップ！レンタルサーバー（Ruby CGI）向け。標準ライブラリのみ使用。
 #
 # 設置:
-#   1. index.cgi と config.json を同じディレクトリに置く（例: public_html/papyru/）
+#   1. index.cgi と config.json を同じディレクトリに置く（例: public_html/wiki/）
 #   2. パーミッション: index.cgi は 700 / config.json は 600 / ディレクトリは 705
 #   3. 1行目のshebangは契約サーバーに合わせて変更
 #   4. Google Cloud Console で OAuth クライアント（ウェブ アプリケーション）を作成し、
 #      承認済みのリダイレクト URI に config.json の redirect_uri を登録
-#   5. https://（ドメイン）/papyru/index.cgi を開く
+#   5. https://（ドメイン）/wiki/index.cgi を開く
 #
 require 'cgi'
 require 'json'
@@ -30,7 +30,11 @@ SESSION_COOKIE = 'papyru_session'
 STATE_COOKIE   = 'papyru_oauth_state'
 RETURN_COOKIE  = 'papyru_return'   # ログイン後に戻るページのID
 ALLOWED_TAGS   = %w[p br b strong i em u s h1 h2 h3 ul ol li blockquote a span div hr pre code
-                    table thead tbody tr th td].freeze
+                    table thead tbody tr th td img].freeze
+# 画像：data/images/<24桁のランダム16進>.<拡張子>。本文には data-img="<ファイル名>" だけを残す
+MAX_IMAGE_BYTES = 8_000_000
+IMAGE_NAME_RE   = /\A[a-f0-9]{24}\.(?:png|jpg|gif|webp)\z/
+IMAGE_TYPES     = { 'png' => 'image/png', 'jpg' => 'image/jpeg', 'gif' => 'image/gif', 'webp' => 'image/webp' }.freeze
 # ブラウザが打ち消し線に使う別名タグは <s> にそろえる
 TAG_ALIASES    = { 'strike' => 's', 'del' => 's' }.freeze
 
@@ -258,6 +262,10 @@ def sanitize(html)
     tag     = TAG_ALIASES.fetch(tag, tag)
     attrs   = Regexp.last_match(3)
     next '' unless ALLOWED_TAGS.include?(tag)
+    if tag == 'img'   # 自分のサーバーにアップロードした画像だけ。外部URL・data: などは捨てる
+      nm = closing.empty? ? attrs[/\bdata-img\s*=\s*"([^"]*)"/i, 1] : nil
+      next(nm && nm.match?(IMAGE_NAME_RE) ? %(<img data-img="#{nm}">) : '')
+    end
     next "</#{tag}>" unless closing.empty?
     if tag == 'a'
       href = attrs[/\bhref\s*=\s*"([^"]*)"/i, 1] || attrs[/\bhref\s*=\s*'([^']*)'/i, 1]
@@ -266,10 +274,14 @@ def sanitize(html)
       end
       next '<a>'
     end
-    # 子ページ一覧の埋め込み部品（中身はブラウザが表示のたびに作るので、空の div だけを残す）
+    # 埋め込み部品（子ページ一覧・目次）。中身はブラウザが表示のたびに作るので、空の div だけを残す
     if tag == 'div'
-      wk = attrs[/\bclass\s*=\s*"\s*(papyru-children(?:-all)?)\s*"/i, 1]
+      wk = attrs[/\bclass\s*=\s*"\s*(papyru-(?:children(?:-all)?|toc(?:-[12])?))\s*"/i, 1]
       next %(<div class="#{wk.downcase}">) if wk
+      if attrs.match?(/\bclass\s*=\s*"\s*papyru-search\s*"/i)   # キーワード一覧：検索語だけ data-kw に残す
+        kw = attrs[/\bdata-kw\s*=\s*"([^"]*)"/i, 1].to_s.gsub(/[<>\x00-\x1f]/, '')
+        next %(<div class="papyru-search" data-kw="#{kw[0, 200]}">)
+      end
     end
     # 字下げ：段落・見出しの class="ind1"〜"ind6" だけを残す（それ以外の属性は捨てる）
     if %w[p h1 h2 h3 div].include?(tag)
@@ -304,6 +316,30 @@ def write_parent(id, pid)
   else
     File.write(parent_path(id), pid)
     File.chmod(0o600, parent_path(id))
+  end
+end
+
+# ---- ステータス（<id>.status。無ければ「ステータス無し」） ----
+
+STATUSES = %w[draft review approved].freeze
+
+def status_path(id)
+  File.join(DATA_DIR, "#{id}.status")
+end
+
+def read_status(id)
+  path = status_path(id)
+  return '' unless File.file?(path)
+  st = File.read(path, encoding: 'utf-8').strip
+  STATUSES.include?(st) ? st : ''
+end
+
+def write_status(id, st)
+  if STATUSES.include?(st)
+    File.write(status_path(id), st)
+    File.chmod(0o600, status_path(id))
+  elsif File.file?(status_path(id))
+    File.delete(status_path(id))
   end
 end
 
@@ -348,6 +384,56 @@ def post_only(cgi)
     return false
   end
   true
+end
+
+# ---- 画像（ログインしているときだけ、index.cgi 経由で配信する） ----
+IMAGES_DIR = File.join(DATA_DIR, 'images')
+
+# 先頭のバイト列で画像の種類を判定する（SVG など、スクリプトを含みうる形式は受け付けない）
+def image_ext(data)
+  b = data.b
+  return 'png'  if b.start_with?("\x89PNG\r\n\x1A\n".b)
+  return 'jpg'  if b.start_with?("\xFF\xD8\xFF".b)
+  return 'gif'  if b.start_with?('GIF87a'.b) || b.start_with?('GIF89a'.b)
+  return 'webp' if b.bytesize > 12 && b[0, 4] == 'RIFF'.b && b[8, 4] == 'WEBP'.b
+  nil
+end
+
+def handle_upload(cgi)
+  return unless post_only(cgi)
+
+  data = cgi['data64'].to_s.unpack1('m')
+  return send_json(cgi, { ok: false, error: 'empty' }, 'BAD_REQUEST') if data.nil? || data.empty?
+  return send_json(cgi, { ok: false, error: 'too large' }, 'BAD_REQUEST') if data.bytesize > MAX_IMAGE_BYTES
+
+  ext = image_ext(data)
+  return send_json(cgi, { ok: false, error: 'unsupported image type' }, 'BAD_REQUEST') unless ext
+
+  Dir.mkdir(IMAGES_DIR, 0o700) unless Dir.exist?(IMAGES_DIR)
+  name = "#{SecureRandom.hex(12)}.#{ext}"
+  File.open(File.join(IMAGES_DIR, name), File::WRONLY | File::CREAT | File::EXCL, 0o600) do |f|
+    f.binmode
+    f.write(data)
+  end
+  send_json(cgi, { ok: true, name: name })
+end
+
+def handle_image(cgi)
+  name = cgi['name'].to_s
+  path = File.join(IMAGES_DIR, name)
+  unless name.match?(IMAGE_NAME_RE) && File.file?(path)
+    return send_json(cgi, { ok: false, error: 'not found' }, 'NOT_FOUND')
+  end
+
+  data = File.binread(path)
+  $stdout.binmode
+  print "Content-Type: #{IMAGE_TYPES.fetch(name[/\.(\w+)\z/, 1])}\r\n"
+  print "Content-Length: #{data.bytesize}\r\n"
+  print "Cache-Control: private, max-age=31536000, immutable\r\n"   # 名前はランダムで、内容は変わらない
+  print "X-Content-Type-Options: nosniff\r\n"
+  print "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\n"
+  print "\r\n"
+  print data
 end
 
 # ---- 更新履歴（data/history/<文書ID>/<版ID>.html と .meta） ----
@@ -431,11 +517,11 @@ def handle_list(cgi)
   docs = Dir.glob(File.join(DATA_DIR, '*.html')).map do |f|
     id = File.basename(f, '.html')
     next nil unless valid_name?(id)
-    { id: id, title: read_title(id), parent: read_parent(id), mtime: File.mtime(f) }
+    { id: id, title: read_title(id), parent: read_parent(id), status: read_status(id), mtime: File.mtime(f) }
   end.compact
   docs.sort_by! { |d| -d[:mtime].to_i }
   send_json(cgi, docs.map do |d|
-    { id: d[:id], title: d[:title], parent: d[:parent], updated: d[:mtime].strftime('%Y-%m-%d %H:%M') }
+    { id: d[:id], title: d[:title], parent: d[:parent], status: d[:status], updated: d[:mtime].strftime('%Y-%m-%d %H:%M') }
   end)
 end
 
@@ -445,7 +531,7 @@ def handle_load(cgi)
     return send_json(cgi, { ok: false, error: 'not found' }, 'NOT_FOUND')
   end
   html = File.read(doc_path(id), encoding: 'utf-8')
-  send_json(cgi, { ok: true, id: id, title: read_title(id), parent: read_parent(id), html: html,
+  send_json(cgi, { ok: true, id: id, title: read_title(id), parent: read_parent(id), status: read_status(id), html: html,
                    updated: updated_text(id), revisions: revision_ids(id).length })
 end
 
@@ -467,6 +553,21 @@ def handle_move(cgi)
   send_json(cgi, { ok: true, id: id, parent: pid })
 end
 
+# ステータスを変更する（空なら「ステータス無し」）。本文の更新ではないので、履歴は増えない
+def handle_status(cgi)
+  return unless post_only(cgi)
+
+  id = cgi['id'].to_s
+  st = cgi['status'].to_s
+  return send_json(cgi, { ok: false, error: 'not found' }, 'NOT_FOUND') unless doc_exists?(id)
+  unless st.empty? || STATUSES.include?(st)
+    return send_json(cgi, { ok: false, error: 'invalid status' }, 'BAD_REQUEST')
+  end
+
+  write_status(id, st)
+  send_json(cgi, { ok: true, id: id, status: read_status(id) })
+end
+
 # 文書を削除する。実ファイルは data/trash/ へ移すだけで、完全には消さない。
 # 子ページは削除した文書の親（無ければ最上位）へ繰り上げる。
 def handle_delete(cgi)
@@ -482,7 +583,7 @@ def handle_delete(cgi)
   trash = File.join(DATA_DIR, 'trash')
   Dir.mkdir(trash, 0o700) unless Dir.exist?(trash)
   stamp = Time.now.strftime('%Y%m%d%H%M%S')
-  %w[html title parent].each do |ext|
+  %w[html title parent status].each do |ext|
     src = File.join(DATA_DIR, "#{id}.#{ext}")
     File.rename(src, File.join(trash, "#{stamp}_#{id}.#{ext}")) if File.file?(src)
   end
@@ -528,7 +629,8 @@ def handle_save(cgi, email)
   # 親は新規作成のときだけ指定できる（既存文書の親変更は move を使う）
   pid = cgi['parent'].to_s
   write_parent(id, pid) if new_doc && doc_exists?(pid)
-  send_json(cgi, { ok: true, id: id, title: title, parent: read_parent(id),
+  write_status(id, cgi['status'].to_s) if new_doc   # ステータスも新規作成のときだけ（変更は status を使う）
+  send_json(cgi, { ok: true, id: id, title: title, parent: read_parent(id), status: read_status(id),
                    updated: updated_text(id), revisions: revision_ids(id).length })
 end
 
@@ -540,7 +642,7 @@ LOGIN_PAGE = <<~'HTML'
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Papyru - ログイン</title>
+<title>wiki - ログイン</title>
 <style>
   body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
          font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; background: #f2f3f5; }
@@ -553,7 +655,7 @@ LOGIN_PAGE = <<~'HTML'
 </head>
 <body>
 <div class="box">
-  <h1>Papyru</h1>
+  <h1>wiki</h1>
   <p>Googleアカウントでログインしてください。</p>
   <a class="btn" href="{{LOGIN_URL}}">Googleでログイン</a>
 </div>
@@ -567,7 +669,7 @@ PAGE = <<~'HTML'
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Papyru</title>
+<title>wiki</title>
 <style>
   * { box-sizing: border-box; }
   [hidden] { display: none !important; }
@@ -575,7 +677,31 @@ PAGE = <<~'HTML'
   body { margin: 0; display: flex; flex-direction: column; font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; background: #f2f3f5; color: #222; }
 
   header { flex: none; background: #2f3640; color: #fff; padding: 8px 14px; font-weight: bold; display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
-  header .user { font-weight: normal; font-size: 13px; }
+  header .appbtn { display: flex; align-items: center; justify-content: center; width: 36px; height: 32px; padding: 0; background: transparent;
+    color: #fff; border: 1px solid #667; border-radius: 6px; cursor: pointer; }
+  header .appbtn:hover, header .appbtn[aria-expanded="true"] { background: rgba(255,255,255,.14); }
+  header .appbtn svg { width: 18px; height: 18px; fill: currentColor; }
+  /* 右からスライドして出るメニュー */
+  #appmenu-backdrop { position: fixed; inset: 0; z-index: 55; background: rgba(20,24,32,.4); opacity: 0; visibility: hidden;
+    transition: opacity .22s ease, visibility 0s .22s; }
+  #appmenu-backdrop.open { opacity: 1; visibility: visible; transition: opacity .22s ease; }
+  #appmenu { position: fixed; top: 0; right: 0; bottom: 0; z-index: 60; width: min(300px, 86vw); box-sizing: border-box;
+    display: flex; flex-direction: column; background: #fff; color: #222; font-weight: normal;
+    box-shadow: -4px 0 18px rgba(0,0,0,.22); transform: translateX(100%); visibility: hidden;
+    transition: transform .22s ease, visibility 0s .22s; padding-bottom: env(safe-area-inset-bottom); }
+  #appmenu.open { transform: translateX(0); visibility: visible; transition: transform .22s ease; }
+  @media (prefers-reduced-motion: reduce) { #appmenu, #appmenu-backdrop { transition: none !important; } }
+  #appmenu .am-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px 12px 18px;
+    background: #2f3640; color: #fff; font-weight: bold; }
+  #appmenu .am-head button { font: inherit; background: transparent; color: #fff; border: 1px solid #667; border-radius: 6px;
+    width: 32px; height: 30px; cursor: pointer; }
+  #appmenu .am-item { display: block; padding: 14px 18px; color: #222; text-decoration: none; font-size: 15px;
+    border-left: 4px solid transparent; }
+  #appmenu .am-item:hover, #appmenu .am-item:focus-visible { background: #f1f3f6; outline: none; }
+  #appmenu .am-item.cur { border-left-color: #2f6fed; background: #eef3ff; font-weight: bold; }
+  #appmenu .am-sep { height: 1px; background: #e2e5ea; margin: 8px 0; }
+  #appmenu .am-user { padding: 6px 18px; font-size: 12px; color: #667; word-break: break-all; }
+  #appmenu .am-out { color: #b3261e; }
   header a { color: #fff; }
   header .menu { font: inherit; background: transparent; color: #fff; border: 1px solid #667; border-radius: 4px; padding: 2px 8px; cursor: pointer; margin-right: 6px; }
 
@@ -593,6 +719,14 @@ PAGE = <<~'HTML'
   #doclist li button:hover, #picklist li button:hover, #histlist li button:hover { background: #f3f6fd; }
   #doclist li button.active, #histlist li button.active { background: #e3ecff; font-weight: bold; }
   .doc .t { display: block; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .st { display: inline-block; font-size: 10px; line-height: 1.5; padding: 0 6px; margin-left: 6px; border-radius: 8px; font-weight: bold; vertical-align: 1px; }
+  .st-draft { background: #e6e8ec; color: #555; }
+  .st-review { background: #fff1d6; color: #9a5b00; }
+  .st-approved { background: #dcf3e1; color: #17743a; }
+  #docStatus { font: inherit; font-size: 12px; padding: 2px 6px; margin-left: 2px; border-radius: 10px; border: 1px solid #c5cad3; background: #fff; color: #444; vertical-align: 1px; }
+  #docStatus[data-st="draft"] { background: #e6e8ec; }
+  #docStatus[data-st="review"] { background: #fff1d6; color: #9a5b00; border-color: #e8c47a; }
+  #docStatus[data-st="approved"] { background: #dcf3e1; color: #17743a; border-color: #8fd0a1; }
   .doc .d { display: block; font-size: 11px; color: #888; font-weight: normal; }
   .empty { padding: 14px 12px; color: #888; font-size: 13px; }
   /* 親子ツリー：トグル＋文書ボタンを横に並べ、深さに応じて字下げする */
@@ -625,7 +759,11 @@ PAGE = <<~'HTML'
   #editor:focus { box-shadow: 0 0 0 2px #cfe0ff; }
   #editor h1, #editor h2, #editor h3 { line-height: 1.3; }
   #editor blockquote { margin: 0; padding-left: 12px; border-left: 4px solid #ccc; color: #555; }
-  #editor pre, #editor code { background: #f4f4f4; font-family: monospace; }
+  #editor code, #histview code { background: #f1f3f5; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Noto Sans Mono CJK JP', 'Noto Sans Mono', monospace; font-size: .92em; padding: 1px 4px; border-radius: 3px; }
+  #editor pre, #histview pre { margin: 12px 0; padding: 12px 14px; background: #f6f8fa; border: 1px solid #e1e4ea; border-radius: 6px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Noto Sans Mono CJK JP', 'Noto Sans Mono', monospace;
+    font-size: 13.5px; line-height: 1.6; white-space: pre; tab-size: 4; overflow-x: auto; max-width: 100%; }
+  #editor pre code, #histview pre code { background: none; padding: 0; font-size: inherit; }
   #editor h1 { font-size: 1.8em; margin: .8em 0 .4em; }
   #editor h2 { font-size: 1.45em; margin: .8em 0 .4em; }
   #editor h3 { font-size: 1.2em; margin: .8em 0 .4em; }
@@ -633,10 +771,25 @@ PAGE = <<~'HTML'
   #editor .ind3, #histview .ind3 { margin-left: 6em; }  #editor .ind4, #histview .ind4 { margin-left: 8em; }
   #editor .ind5, #histview .ind5 { margin-left: 10em; } #editor .ind6, #histview .ind6 { margin-left: 12em; }
   #editor li > ul, #editor li > ol { margin: 2px 0; }
-  .papyru-children, .papyru-children-all { border: 1px solid #d5dbe6; border-left: 4px solid #5b8def; background: #f6f8fc;
+  /* 画像：幅が広いときは、本文の幅に収まるよう縮小して表示する（縦横比はそのまま） */
+  #editor img, #histview img { max-width: 100%; width: auto; height: auto; object-fit: contain;
+    box-sizing: border-box; border-radius: 3px; vertical-align: bottom; }
+  /* 表のセルの中など、% の上限が効かない場所でも、本文の幅を超えないようにする */
+  #editor, #histview { container-type: inline-size; }
+  @supports (max-width: 1cqw) {
+    #editor img, #histview img { max-width: min(100%, 100cqw); }
+    #editor td img, #editor th img, #histview td img, #histview th img { max-width: min(100%, calc(100cqw - 24px)); }
+  }
+  #editor img[data-img]:not([src]) { min-width: 40px; min-height: 24px; background: #eee; }
+  body.mode-view #editor img { cursor: zoom-in; }
+  .papyru-children, .papyru-children-all, .papyru-toc, .papyru-toc-1, .papyru-toc-2, .papyru-search { border: 1px solid #d5dbe6; border-left: 4px solid #5b8def; background: #f6f8fc;
     border-radius: 4px; padding: 8px 12px; margin: 12px 0; user-select: none; }
   #histview .papyru-children:empty::before, #histview .papyru-children-all:empty::before {
     content: '［子ページ一覧を埋め込み］'; color: #667; font-size: 13px; }
+  #histview .papyru-toc:empty::before, #histview .papyru-toc-1:empty::before, #histview .papyru-toc-2:empty::before {
+    content: '［目次を埋め込み］'; color: #667; font-size: 13px; }
+  #histview .papyru-search:empty::before { content: '［キーワード一覧を埋め込み］'; color: #667; font-size: 13px; }
+  .pc-kw { font: inherit; font-size: 12px; padding: 1px 6px; width: 12em; max-width: 40vw; }
   .pc-head { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: bold; color: #47536b; margin-bottom: 4px; }
   .pc-ctl { margin-left: auto; display: flex; gap: 6px; align-items: center; }
   .pc-ctl select, .pc-ctl button { font: inherit; font-size: 12px; padding: 1px 6px; }
@@ -718,14 +871,63 @@ PAGE = <<~'HTML'
     #histlist { width: auto; max-height: 28%; flex: none; }
     #sidebar { position: absolute; z-index: 20; top: 0; bottom: 0; left: 0; box-shadow: 2px 0 10px rgba(0,0,0,.2); }
     #editor { margin: 10px; padding: 16px; }
+
+    /* ヘッダーは1行に */
+    header { flex-wrap: nowrap; padding: 6px 10px; }
+    /* ツールバーは、1行にして横にスライドする。画面の上に固定するのは、この1〜2行だけ */
+    .toolbars { display: contents; }
+    .bar { position: sticky; z-index: 5; flex-wrap: nowrap; gap: 4px; align-items: center;
+      height: 46px; box-sizing: border-box; padding: 6px 8px;
+      overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; overscroll-behavior-x: contain;
+      scrollbar-width: none;
+      /* 左右に続きがあるときだけ、端に影を出す */
+      background:
+        linear-gradient(to right, #fff 30%, rgba(255,255,255,0)) 0 0 / 36px 100% no-repeat local,
+        linear-gradient(to left, #fff 30%, rgba(255,255,255,0)) 100% 0 / 36px 100% no-repeat local,
+        radial-gradient(farthest-side at 0 50%, rgba(0,0,0,.22), rgba(0,0,0,0)) 0 0 / 12px 100% no-repeat scroll,
+        radial-gradient(farthest-side at 100% 50%, rgba(0,0,0,.22), rgba(0,0,0,0)) 100% 0 / 12px 100% no-repeat scroll,
+        #fff; }
+    .bar::-webkit-scrollbar { display: none; }
+    .bar > * { flex: 0 0 auto; }
+    .bar button { padding: 6px 11px; white-space: nowrap; }
+    .bar .sep { margin: 0 2px; }
+    .bar .doctitle { max-width: 55vw; }
+    #fmtbar { top: 0; }
+    #actbar { top: 0; }
+    body.mode-edit #actbar { top: 46px; }
+    .crumbs { flex-wrap: nowrap; overflow-x: auto; white-space: nowrap; padding: 4px 10px; scrollbar-width: none; }
+    .crumbs::-webkit-scrollbar { display: none; }
+    .crumbs > * { flex: 0 0 auto; }
+    /* メッセージは、画面の下に一時的に出す */
+    #status { display: none; position: fixed; left: 10px; right: 10px; bottom: 14px; z-index: 40; margin: 0;
+      padding: 9px 12px; background: rgba(35,40,52,.94); color: #fff; border-radius: 8px;
+      font-size: 13px; line-height: 1.5; pointer-events: none; box-shadow: 0 2px 10px rgba(0,0,0,.25); }
+    #status.show:not(:empty) { display: block; }
+    #status.err { background: #b3261e; color: #fff; }
   }
 </style>
 </head>
 <body>
 <header>
-  <span><button id="menu" class="menu" title="文書一覧の表示／非表示">☰</button>Papyru（プロトタイプ）</span>
-  <span class="user">{{EMAIL}} ・ <a href="{{SCRIPT_HTML}}?action=logout">ログアウト</a></span>
+  <span><button id="menu" class="menu" title="文書一覧の表示／非表示">☰</button>wiki</span>
+  <button id="appmenuBtn" class="appbtn" type="button" aria-label="アプリメニューを開く" aria-haspopup="true"
+          aria-expanded="false" aria-controls="appmenu" title="アプリの切り替え・ログアウト">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="5" r="2"/><circle cx="12" cy="5" r="2"/><circle cx="19" cy="5" r="2"/>
+      <circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/>
+      <circle cx="5" cy="19" r="2"/><circle cx="12" cy="19" r="2"/><circle cx="19" cy="19" r="2"/></svg>
+  </button>
 </header>
+
+<div id="appmenu-backdrop"></div>
+<nav id="appmenu" aria-label="アプリメニュー">
+  <div class="am-head"><span>メニュー</span><button id="appmenuClose" type="button" aria-label="閉じる">✕</button></div>
+  <a class="am-item cur" href="/wiki/" aria-current="page">Wiki</a>
+  <a class="am-item" href="/ticket/">チケット管理</a>
+  <a class="am-item" href="/board/">ホワイトボード</a>
+  <div class="am-sep"></div>
+  <div class="am-user">{{EMAIL}}</div>
+  <a class="am-item am-out" href="{{SCRIPT_HTML}}?action=logout">ログアウト</a>
+</nav>
 
 <div class="layout">
   <aside id="sidebar">
@@ -744,6 +946,7 @@ PAGE = <<~'HTML'
         <button data-cmd="formatBlock" data-arg="h3" title="見出し3（小）">見出し3</button>
         <button data-cmd="formatBlock" data-arg="p">本文</button>
         <button data-cmd="formatBlock" data-arg="blockquote">引用</button>
+        <button id="codeBtn" title="コードブロック（もう一度押すと本文に戻る。末尾で Enter を2回押すと抜ける）">コード</button>
         <span class="sep"></span>
         <button data-cmd="bold"><b>B</b></button>
         <button data-cmd="italic"><i>I</i></button>
@@ -755,11 +958,14 @@ PAGE = <<~'HTML'
         <span class="sep"></span>
         <button id="pagelink" title="選択した文字を、保存済みのページへのリンクにする">ページリンク</button>
         <button data-cmd="createLink" title="選択した文字を、URLへのリンクにする">URLリンク</button>
+        <button id="wikipediaBtn" title="キーワードを入力して、Wikipediaへのリンク「キーワード(wikipedia)」を挿入（文字を選択していればそれがキーワード）">Wikipedia</button>
         <button id="unlinkBtn" title="選択範囲（またはカーソル位置）のリンクを解除">リンク解除</button>
         <span class="sep"></span>
         <button data-cmd="insertHorizontalRule">罫線</button>
         <button id="outdentBtn" title="字下げを減らす（Shift+Tab）">⇤ 戻す</button>
         <button id="indentBtn" title="字下げを増やす（Tab）">⇥ 字下げ</button>
+        <button id="imgBtn" title="画像をアップロードして埋め込む（貼り付け・ドラッグでも可）">画像</button>
+        <input type="file" id="imgFile" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
         <span class="sep"></span>
         <button id="tblInsert" title="カーソル位置に3行×3列の表を挿入">表</button>
         <button data-tbl="rowAdd" title="カーソルのある行の下に行を追加">行＋</button>
@@ -768,13 +974,16 @@ PAGE = <<~'HTML'
         <button data-tbl="colDel" title="カーソルのある列を削除">列－</button>
         <button data-tbl="tblDel" title="カーソルのある表を削除">表削除</button>
         <span class="sep"></span>
+        <button id="tocBtn" title="このページの見出しから目次を作り、カーソルのある段落の下に埋め込む">目次</button>
+        <button id="searchBtn" title="キーワードをタイトルに含むページの一覧を、カーソルのある段落の下に埋め込む">キーワード一覧</button>
         <button id="childrenBtn" title="このページの子ページ一覧を、カーソルのある段落の下に埋め込む">子ページ一覧</button>
         <span class="sep"></span>
         <button data-cmd="removeFormat">書式クリア</button>
       </div>
 
-      <div class="bar">
+      <div class="bar" id="actbar">
         <span class="doctitle">タイトル：<strong id="doctitle">無題</strong><span id="modebadge" class="badge">編集中</span></span>
+        <select id="docStatus" title="このページのステータス（変更するとすぐ反映されます）" aria-label="ステータス"><option value="">ステータス無し</option><option value="draft">Draft</option><option value="review">In review</option><option value="approved">Approved</option></select>
         <button id="editBtn" class="primary view-only" title="このページを編集する">編集</button>
         <button id="save" class="primary edit-only">保存 (Ctrl+S)</button>
         <button id="saveView" class="edit-only" title="保存して、閲覧モードに戻る">保存して閲覧</button>
@@ -863,6 +1072,7 @@ PAGE = <<~'HTML'
   let docs = [];        // 保存済み文書の一覧キャッシュ [{id, title, parent, updated}]
   let savedRange = null;
   let popAnchor = null;
+  let currentStatus = '';   // 開いている文書のステータス（'' / draft / review / approved）
   let currentParent = '';   // 開いている文書（新規なら作成予定）の親ID。空なら最上位
   let pickerMode = 'link';  // 'link' = ページリンクの選択 / 'parent' = 親ページの選択
   let mode = 'edit';        // 'view' = 閲覧モード（読み取り専用） / 'edit' = 編集モード
@@ -876,10 +1086,37 @@ PAGE = <<~'HTML'
     try { localStorage.setItem(COLLAPSE_KEY, JSON.stringify([...collapsed])); } catch (_) {}
   };
 
+  let statusTimer = null;
   const msg = (text, err = false) => {
     statusEl.textContent = text;
-    statusEl.className = err ? 'err' : '';
+    statusEl.className = (err ? 'err ' : '') + 'show';
+    // スマホでは、メッセージを画面下に一時表示する（PCでは、ツールバーの右端に出しっぱなし）
+    clearTimeout(statusTimer);
+    statusTimer = setTimeout(() => statusEl.classList.remove('show'), err ? 9000 : 4500);
   };
+
+  // ---------- アプリメニュー（右上のボタン。右からスライドして出る） ----------
+  const appBtn = $('appmenuBtn'), appMenu = $('appmenu'), appBackdrop = $('appmenu-backdrop');
+  const appFocusable = () => Array.from(appMenu.querySelectorAll('a[href], button'));
+  function setAppMenu(open) {
+    appMenu.classList.toggle('open', open);
+    appBackdrop.classList.toggle('open', open);
+    appBtn.setAttribute('aria-expanded', String(open));
+    appBtn.setAttribute('aria-label', open ? 'アプリメニューを閉じる' : 'アプリメニューを開く');
+    if (open) appFocusable()[1].focus(); else appBtn.focus();
+  }
+  appBtn.addEventListener('click', () => setAppMenu(!appMenu.classList.contains('open')));
+  $('appmenuClose').addEventListener('click', () => setAppMenu(false));
+  appBackdrop.addEventListener('click', () => setAppMenu(false));
+  document.addEventListener('keydown', e => {
+    if (!appMenu.classList.contains('open')) return;
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setAppMenu(false); return; }
+    if (e.key === 'Tab') {   // メニューの中だけで Tab を回す
+      const f = appFocusable(), first = f[0], last = f[f.length - 1];
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    }
+  }, true);
 
   // ---------- 親子ツリー ----------
 
@@ -967,15 +1204,65 @@ PAGE = <<~'HTML'
     return m ? m[1] : null;
   }
 
+  // ---------- Wikipediaリンク：表示は「キーワード(wikipedia)」に統一 ----------
+  const WIKI_RE = /^https?:\/\/([a-z-]+)\.(?:m\.)?wikipedia\.org\/wiki\/([^?#]+)/i;
+  const WIKI_SUFFIX = '(wikipedia)';
+  function wikiKeywordOf(a) {
+    const m = WIKI_RE.exec(a.getAttribute('href') || '');
+    if (!m) return null;
+    try { return decodeURIComponent(m[2]).replace(/_/g, ' '); } catch (e) { return m[2].replace(/_/g, ' '); }
+  }
+  function normalizeWikipediaLinks(root) {
+    root.querySelectorAll('a[href]').forEach(a => {
+      const kw = wikiKeywordOf(a);
+      if (!kw) return;
+      const label = kw + WIKI_SUFFIX;
+      if (a.textContent !== label) a.textContent = label;
+    });
+  }
+  function insertWikipediaLink() {
+    const sel = getSelection();
+    const inEditor = sel.rangeCount && editor.contains(sel.anchorNode);
+    const saved = inEditor ? sel.getRangeAt(0).cloneRange() : null;
+    const def = inEditor ? sel.toString().trim() : '';
+    const kw = (prompt('Wikipediaで調べるキーワード', def) || '').trim();
+    if (!kw) { editor.focus(); return; }
+    editor.focus();
+    if (saved) { sel.removeAllRanges(); sel.addRange(saved); }
+    const a = document.createElement('a');
+    a.href = 'https://ja.wikipedia.org/wiki/' + encodeURIComponent(kw.replace(/ /g, '_'));
+    a.textContent = kw + WIKI_SUFFIX;
+    const r = getSelection().rangeCount ? getSelection().getRangeAt(0) : null;
+    if (r && editor.contains(r.commonAncestorContainer)) {
+      r.deleteContents();
+      r.insertNode(a);
+      r.setStartAfter(a); r.collapse(true);
+      getSelection().removeAllRanges(); getSelection().addRange(r);
+    } else {
+      editor.appendChild(a);
+    }
+    editor.dispatchEvent(new Event('input'));
+  }
+
   // ブラウザによってhrefが絶対URLに変換されることがあるため、保存前に #doc=ID に揃える
   function serializeEditor() {
     const clone = editor.cloneNode(true);
+    // 画像は data-img だけ残す（アップロードされていない画像は保存しない）
+    clone.querySelectorAll('img').forEach(i => {
+      const n = i.dataset.img;
+      if (!n) { i.remove(); return; }
+      const c = document.createElement('img');
+      c.setAttribute('data-img', n);
+      i.replaceWith(c);
+    });
     // 子ページ一覧は、中身を捨てて目印の空 div だけを保存する
     clone.querySelectorAll(WIDGET_SEL).forEach(w => {
       const d = document.createElement('div');
-      d.className = w.classList.contains('papyru-children-all') ? 'papyru-children-all' : 'papyru-children';
+      d.className = widgetClass(w);
+      if (d.className === 'papyru-search') d.setAttribute('data-kw', w.dataset.kw || '');
       w.replaceWith(d);
     });
+    normalizeWikipediaLinks(clone);
     clone.querySelectorAll('a').forEach(a => {
       const id = docIdOf(a);
       if (id) a.setAttribute('href', '#doc=' + id);
@@ -1103,6 +1390,42 @@ PAGE = <<~'HTML'
     else applyPageLink(id);
   }
 
+  // ---------- ステータス ----------
+  const STATUS_LABEL = { draft: 'Draft', review: 'In review', approved: 'Approved' };
+  function statusBadge(st) {
+    if (!STATUS_LABEL[st]) return null;
+    const b = document.createElement('span');
+    b.className = 'st st-' + st;
+    b.textContent = STATUS_LABEL[st];
+    return b;
+  }
+  function syncStatusUI() {
+    const el = $('docStatus');
+    el.value = currentStatus;
+    el.dataset.st = currentStatus;
+  }
+  async function applyStatus(st) {
+    if (st === currentStatus) return;
+    if (!currentId) {   // 未保存の新規ページ：保存時に反映される
+      currentStatus = st; syncStatusUI();
+      return msg(st ? `ステータスを ${STATUS_LABEL[st]} にしました（保存すると反映されます）` : 'ステータスを解除しました');
+    }
+    try {
+      const r = await fetch(ep + '?action=status', { method: 'POST', body: new URLSearchParams({ id: currentId, status: st }) });
+      const j = await readJson(r);
+      if (!r.ok || !j.ok) throw new Error(j.error || r.status);
+      currentStatus = j.status || '';
+      syncStatusUI();
+      await refresh();
+      revealCurrent();
+      msg(currentStatus ? `ステータスを ${STATUS_LABEL[currentStatus]} にしました` : 'ステータスを解除しました');
+    } catch (e) {
+      syncStatusUI();
+      msg('ステータスの変更に失敗しました：' + e.message, true);
+    }
+  }
+  $('docStatus').addEventListener('change', e => applyStatus(e.target.value));
+
   // 親ページを変更する。保存済みの文書はサーバーに反映し、未保存の新規文書は保存時に反映する
   async function applyParent(pid) {
     closePicker();
@@ -1188,6 +1511,8 @@ PAGE = <<~'HTML'
     b.dataset.id = d.id;
     b.innerHTML = '<span class="t"></span><span class="d"></span>';
     b.querySelector('.t').textContent = d.title;
+    const sb = statusBadge(d.status);
+    if (sb) b.querySelector('.t').append(sb);
     b.querySelector('.d').textContent = flat && d.parent
       ? pathText(d.id)                                              // 絞り込み中は親の名前を添える
       : d.updated + (childCount ? ` ・ 子ページ ${childCount}件` : '');
@@ -1302,15 +1627,17 @@ PAGE = <<~'HTML'
   function deriveTitle() {
     const src = Array.from(editor.childNodes).map(n =>
       n.nodeType === 3 ? n.textContent : (n.nodeType === 1 && !n.matches(WIDGET_SEL) ? n.innerText : '')).join('\n');
-    const line = src.split('\n').map(s => s.trim()).find(s => s) || '';
+    let line = src.split('\n').map(s => s.trim()).find(s => s) || '';
+    if (line === 'ここに入力してください。') line = '';   // 初期の案内文はタイトルにしない
     return Array.from(line).slice(0, 60).join('') || '無題';
   }
 
   function updateTitleLabel() {
     renderWidgets();
+    hydrateImages(editor);
     const t = deriveTitle();
     titleEl.textContent = t;
-    document.title = t + ' - Papyru';   // タブ・ブックマーク・履歴に、ページのタイトルを出す
+    document.title = t + ' - wiki';   // タブ・ブックマーク・履歴に、ページのタイトルを出す
     updateCrumbs();
     updateButtons();
   }
@@ -1329,6 +1656,7 @@ PAGE = <<~'HTML'
         body: new URLSearchParams({
           id: currentId,                 // 空なら新規（ファイル名はサーバーが自動採番）
           parent: currentParent,         // 親は新規作成のときだけ使われる
+          status: currentStatus,         // ステータスも新規作成のときだけ使われる
           title: deriveTitle(),
           html64: toBase64(serializeEditor()),
         }),
@@ -1337,6 +1665,8 @@ PAGE = <<~'HTML'
       if (!r.ok || !j.ok) throw new Error(j.error || r.status);
       currentId = j.id;
       currentParent = j.parent || '';
+      currentStatus = j.status || '';
+      syncStatusUI();
       dirty = false;
       syncUrl(j.id, 'replace');
       msg(j.revisions > 1 ? `保存しました：${j.title}（履歴 ${j.revisions}件）` : `保存しました：${j.title}`);
@@ -1409,8 +1739,11 @@ PAGE = <<~'HTML'
       const j = await readJson(r);
       if (!r.ok || !j.ok) throw new Error(j.error || r.status);
       editor.innerHTML = j.html;
+      normalizeWikipediaLinks(editor);
       currentId = j.id;
       currentParent = j.parent || '';
+      currentStatus = j.status || '';
+      syncStatusUI();
       dirty = false;
       setMode('view');
       setMeta({ updated: j.updated, revisions: j.revisions });
@@ -1449,6 +1782,8 @@ PAGE = <<~'HTML'
     editor.innerHTML = '<p><br></p>';
     currentId = '';
     currentParent = parentId;
+    currentStatus = '';
+    syncStatusUI();
     dirty = false;
     setMeta(null);
     setMode('edit');
@@ -1525,6 +1860,7 @@ PAGE = <<~'HTML'
     const push = (el, prefix) => {
       const c = el.cloneNode(true);
       c.querySelectorAll('br').forEach(b => b.replaceWith('\n'));
+      c.querySelectorAll('img').forEach(i => i.replaceWith('［画像］'));
       const lv = (/\bind([1-6])\b/.exec(el.className || '') || [])[1] | 0;
       c.textContent.split('\n').map(x => x.replace(/\s+/g, ' ').trim()).filter(Boolean)
         .forEach(x => out.push('　'.repeat(lv) + prefix + x));
@@ -1537,9 +1873,20 @@ PAGE = <<~'HTML'
           if (t) out.push(t);
         } else if (ch.nodeType === 1) {
           const tag = ch.tagName;
-          if (ch.classList.contains('papyru-children')) out.push('［子ページ一覧］');
+          if (ch.classList.contains('papyru-toc') || ch.classList.contains('papyru-toc-2') || ch.classList.contains('papyru-toc-1')) out.push('［目次］');
+          else if (ch.classList.contains('papyru-search')) out.push('［キーワード一覧: ' + (ch.getAttribute('data-kw') || '') + '］');
+          else if (ch.classList.contains('papyru-children')) out.push('［子ページ一覧］');
           else if (ch.classList.contains('papyru-children-all')) out.push('［子ページ一覧（すべての子孫）］');
           else if (tag === 'HR') out.push('────────');
+          else if (tag === 'IMG') out.push('［画像］');
+          else if (tag === 'PRE') {   // コードは字下げ・空行をそのまま比べる
+            const c = ch.cloneNode(true);
+            c.querySelectorAll('br').forEach(b => b.replaceWith('\n'));
+            const ls = c.textContent.replace(/\t/g, '    ').split('\n').map(x => x.replace(/\s+$/, ''));
+            while (ls.length && !ls[0]) ls.shift();
+            while (ls.length && !ls[ls.length - 1]) ls.pop();
+            ls.forEach(x => out.push('│ ' + x));
+          }
           else if (tag === 'TR') {
             const cells = Array.from(ch.cells).map(c => c.textContent.replace(/\s+/g, ' ').trim());
             out.push('｜' + cells.join('｜') + '｜');
@@ -1782,6 +2129,7 @@ PAGE = <<~'HTML'
       const isLatest = histRevs.length > 0 && histRevs[0].rev === rev;
       histSel = { rev, at: j.at, html: j.html, isLatest };
       $('histview').innerHTML = j.html;   // サーバーで許可タグだけに整えた内容
+      hydrateImages($('histview'));
       $('histview').scrollTop = 0;
       $('histinfo').textContent = [j.at, j.by, j.note].filter(Boolean).join(' ・ ') + (isLatest ? '（現在の版）' : '');
       $('histrestore').disabled = isLatest;
@@ -1799,6 +2147,7 @@ PAGE = <<~'HTML'
     const { at, html } = histSel;
     closeHistory();
     editor.innerHTML = html;
+    normalizeWikipediaLinks(editor);
     dirty = true;
     setMode('edit');
     updateTitleLabel();
@@ -1822,58 +2171,330 @@ PAGE = <<~'HTML'
     });
   });
 
-  // ---------- 子ページ一覧（埋め込み部品） ----------
-  // 保存されるのは <div class="papyru-children"></div>（直下のみ）/ papyru-children-all（すべての子孫）だけ。
-  // 中身は、表示のたびにこのページの子ページから作る。
-  const WIDGET_SEL = '.papyru-children, .papyru-children-all';
+  // ---------- コードブロック ----------
+  const closestIn = (node, sel) => {
+    const el = node && (node.nodeType === 3 ? node.parentNode : node);
+    const f = el && el.closest ? el.closest(sel) : null;
+    return f && editor.contains(f) ? f : null;
+  };
+
+  function toggleCodeBlock() {
+    const s = getSelection();
+    if (!s.rangeCount || !editor.contains(s.anchorNode)) { editor.focus(); return; }
+    if (closestIn(s.anchorNode, 'pre')) {
+      document.execCommand('formatBlock', false, 'p');
+    } else {
+      const before = new Set(editor.querySelectorAll('pre'));
+      document.execCommand('formatBlock', false, 'pre');
+      // 複数の段落を選んだときは、ひとつのコードブロックにまとめる
+      const made = Array.from(editor.querySelectorAll('pre')).filter(x => !before.has(x));
+      made.forEach(pre => {
+        if (!pre.isConnected) return;
+        let n;
+        while ((n = pre.nextElementSibling) && made.includes(n)) {
+          pre.append(document.createElement('br'));
+          while (n.firstChild) pre.append(n.firstChild);
+          n.remove();
+        }
+      });
+    }
+    editor.focus();
+    editor.dispatchEvent(new Event('input'));
+  }
+  $('codeBtn').addEventListener('mousedown', e => { e.preventDefault(); toggleCodeBlock(); });
+
+  // 行の先頭にある文字ノード（行は <br> で区切られている）
+  function lineStartNodes(pre, range) {
+    const out = [];
+    const w = document.createTreeWalker(pre, NodeFilter.SHOW_TEXT);
+    for (let n = w.nextNode(); n; n = w.nextNode()) {
+      const prev = n.previousSibling;
+      if (n.parentNode === pre && (!prev || prev.nodeName === 'BR') && range.intersectsNode(n)) out.push(n);
+    }
+    return out;
+  }
+
+  // コードブロックの中の Tab / Shift+Tab。範囲選択があれば、選んだ行をまとめて字下げする
+  function codeIndent(pre, dir) {
+    const sel = getSelection();
+    const r = sel.getRangeAt(0);
+    if (dir > 0 && r.collapsed) { document.execCommand('insertText', false, '\t'); return; }
+    const nodes = lineStartNodes(pre, r);
+    nodes.forEach(n => {
+      if (dir > 0) n.insertData(0, '\t');
+      else {
+        const m = /^(\t| {1,4})/.exec(n.data);
+        if (m) n.deleteData(0, m[0].length);
+      }
+    });
+    if (nodes.length) editor.dispatchEvent(new Event('input'));
+  }
+
+  // 空行で Enter を押すと、コードブロックを抜けて下に段落を作る
+  editor.addEventListener('keydown', e => {
+    if (e.key !== 'Enter' || e.shiftKey || e.ctrlKey || e.altKey || e.metaKey || e.isComposing || mode !== 'edit') return;
+    const sel = getSelection();
+    if (!sel.rangeCount || !sel.isCollapsed) return;
+    const pre = closestIn(sel.anchorNode, 'pre');
+    if (!pre) return;
+    const tail = document.createRange();
+    tail.setStart(sel.anchorNode, sel.anchorOffset);
+    tail.setEnd(pre, pre.childNodes.length);
+    const last = pre.lastChild, prev = last && last.previousSibling;
+    const onEmptyLastLine = tail.toString() === '' && last && last.nodeName === 'BR' && (!prev || prev.nodeName === 'BR');
+    if (!onEmptyLastLine) return;
+    e.preventDefault();
+    last.remove();                                   // 空行の目印
+    if (prev && prev.nodeName === 'BR') prev.remove();   // 直前の改行
+    const para = document.createElement('p');
+    para.append(document.createElement('br'));
+    if (!pre.textContent.trim()) { pre.replaceWith(para); } else { pre.after(para); }
+    placeCaret(para);
+    editor.dispatchEvent(new Event('input'));
+  });
+
+  // ---------- 画像（貼り付け・ドラッグ・ボタンでアップロードして埋め込む） ----------
+  const MAX_IMG_SIDE = 1920;          // これより大きい画像は縮小する
+  const IMG_SOFT_LIMIT = 3_000_000;   // これより大きい画像は圧縮する
+  const IMG_HARD_LIMIT = 8_000_000;   // サーバー側の上限
+
+  const imgSrc = name => ep + '?action=image&name=' + encodeURIComponent(name);
+  // 本文には data-img="<ファイル名>" だけを保存し、表示のたびに src を付ける
+  function hydrateImages(root) {
+    root.querySelectorAll('img[data-img]').forEach(i => {
+      const u = imgSrc(i.dataset.img);
+      if (i.getAttribute('src') !== u) i.setAttribute('src', u);
+      i.loading = 'lazy';
+      if (!i.alt) i.alt = '画像';
+    });
+  }
+
+  const blobToB64 = blob => new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(String(r.result).split(',')[1] || '');
+    r.onerror = () => rej(r.error);
+    r.readAsDataURL(blob);
+  });
+  const canvasBlob = (cv, type, q) => new Promise(res => cv.toBlob(res, type, q));
+
+  // 大きい画像は縮小・圧縮してからアップロードする（GIF はアニメーションを壊さないのでそのまま）
+  async function prepareImage(file) {
+    if (!/^image\/(png|jpeg|gif|webp)$/.test(file.type)) throw new Error('対応していない画像形式です（PNG / JPEG / GIF / WebP）');
+    if (file.type === 'image/gif') return file;
+    let bmp;
+    try { bmp = await createImageBitmap(file); } catch (e) { return file; }
+    const scale = Math.min(1, MAX_IMG_SIDE / Math.max(bmp.width, bmp.height));
+    if (scale === 1 && file.size <= IMG_SOFT_LIMIT) { if (bmp.close) bmp.close(); return file; }
+    const cv = document.createElement('canvas');
+    cv.width = Math.max(1, Math.round(bmp.width * scale));
+    cv.height = Math.max(1, Math.round(bmp.height * scale));
+    cv.getContext('2d').drawImage(bmp, 0, 0, cv.width, cv.height);
+    if (bmp.close) bmp.close();
+    if (file.type === 'image/png') {
+      const png = await canvasBlob(cv, 'image/png');
+      if (png && png.size <= IMG_SOFT_LIMIT) return png;
+    }
+    // JPEG にする（透明な部分は白）
+    const c2 = document.createElement('canvas');
+    c2.width = cv.width; c2.height = cv.height;
+    const x2 = c2.getContext('2d');
+    x2.fillStyle = '#fff';
+    x2.fillRect(0, 0, c2.width, c2.height);
+    x2.drawImage(cv, 0, 0);
+    const jpg = await canvasBlob(c2, 'image/jpeg', 0.85);
+    return jpg && jpg.size < file.size ? jpg : file;
+  }
+
+  async function uploadImage(file) {
+    const blob = await prepareImage(file);
+    if (blob.size > IMG_HARD_LIMIT) throw new Error('画像が大きすぎます（8MBまで）');
+    const r = await fetch(ep + '?action=upload', {
+      method: 'POST',
+      body: new URLSearchParams({ data64: await blobToB64(blob) }),
+    });
+    const j = await readJson(r);
+    if (!r.ok || !j.ok) throw new Error(j.error || r.status);
+    return j.name;
+  }
+
+  // range: 画像を入れる位置（貼り付け・ドロップの時点のカーソル位置）
+  async function insertImages(files, range) {
+    const imgs = files.filter(f => /^image\//.test(f.type));
+    if (!imgs.length) return;
+    const key = currentId;
+    let rg = range;
+    let ok = 0;
+    msg('画像をアップロード中…');
+    for (const f of imgs) {
+      try {
+        const name = await uploadImage(f);
+        if (mode !== 'edit' || currentId !== key) {
+          msg('アップロード中にページが切り替わったため、画像は挿入しませんでした', true);
+          return;
+        }
+        editor.focus();
+        const s = getSelection();
+        if (rg && editor.contains(rg.startContainer)) { s.removeAllRanges(); s.addRange(rg); }
+        document.execCommand('insertHTML', false, `<img data-img="${name}">`);
+        if (s.rangeCount) rg = s.getRangeAt(0).cloneRange();
+        ok++;
+      } catch (e) {
+        msg('画像のアップロードに失敗しました：' + e.message, true);
+        return;
+      }
+    }
+    hydrateImages(editor);
+    editor.dispatchEvent(new Event('input'));
+    msg(`${ok}枚の画像を挿入しました（保存すると確定します）`);
+  }
+
+  const imageFiles = dt => Array.from((dt && dt.files) || []).filter(f => f.type.startsWith('image/'));
+
+  editor.addEventListener('paste', e => {
+    if (mode !== 'edit') return;
+    const files = imageFiles(e.clipboardData);
+    // 文字も一緒に入っているとき（Word などからのコピー）は、通常の貼り付けにする
+    if (!files.length || (e.clipboardData.getData('text/plain') || '').trim()) return;
+    e.preventDefault();
+    const s = getSelection();
+    insertImages(files, s.rangeCount ? s.getRangeAt(0).cloneRange() : null);
+  });
+  editor.addEventListener('dragover', e => {
+    if (imageFiles(e.dataTransfer).length || Array.from((e.dataTransfer && e.dataTransfer.items) || []).some(i => i.kind === 'file' && i.type.startsWith('image/'))) e.preventDefault();
+  });
+  editor.addEventListener('drop', e => {
+    const files = imageFiles(e.dataTransfer);
+    if (!files.length) return;
+    e.preventDefault();   // ブラウザが画像を開いて、編集中のページから離れてしまうのを防ぐ
+    if (mode !== 'edit') { msg('画像を追加するには、編集モードにしてください', true); return; }
+    let rg = null;
+    if (document.caretRangeFromPoint) rg = document.caretRangeFromPoint(e.clientX, e.clientY);
+    else if (document.caretPositionFromPoint) {
+      const cp = document.caretPositionFromPoint(e.clientX, e.clientY);
+      if (cp) { rg = document.createRange(); rg.setStart(cp.offsetNode, cp.offset); rg.collapse(true); }
+    }
+    insertImages(files, rg);
+  });
+
+  let imgRange = null;
+  $('imgBtn').addEventListener('mousedown', e => {
+    e.preventDefault();
+    const s = getSelection();
+    imgRange = s.rangeCount && editor.contains(s.anchorNode) ? s.getRangeAt(0).cloneRange() : null;
+    $('imgFile').click();
+  });
+  $('imgFile').addEventListener('change', e => {
+    const files = Array.from(e.target.files || []);
+    e.target.value = '';
+    insertImages(files, imgRange);
+  });
+  // 閲覧モードで画像をクリックすると、元の大きさで開く
+  editor.addEventListener('click', e => {
+    const img = e.target.closest && e.target.closest('img[data-img]');
+    if (img && mode === 'view') window.open(imgSrc(img.dataset.img), '_blank', 'noopener');
+  });
+
+  // ---------- 埋め込み部品（子ページ一覧・目次） ----------
+  // 保存されるのは目印の空 div（papyru-children / papyru-children-all / papyru-toc / papyru-toc-2 / papyru-toc-1）だけ。
+  // 中身は、表示のたびに現在のページから作る。
+  const WIDGET_SEL = '.papyru-children, .papyru-children-all, .papyru-toc, .papyru-toc-2, .papyru-toc-1, .papyru-search';
+  const widgetClass = w => Array.from(w.classList).find(c => /^papyru-/.test(c)) || '';
+  const isToc = w => /^papyru-toc/.test(widgetClass(w));
+  const tocMax = w => ({ 'papyru-toc': 3, 'papyru-toc-2': 2, 'papyru-toc-1': 1 })[widgetClass(w)] || 3;
+
+  // 目次の対象になる見出し（本文中の h1〜h3。空の見出しは除く）
+  function headingList(max) {
+    return Array.from(editor.querySelectorAll('h1,h2,h3')).filter(h =>
+      +h.tagName[1] <= max && !h.closest(WIDGET_SEL) && h.textContent.trim());
+  }
+
+  function selectEl(cls, title, options, current) {
+    const sel = document.createElement('select');
+    sel.className = cls;
+    sel.title = title;
+    options.forEach(([v, label]) => {
+      const o = document.createElement('option');
+      o.value = v; o.textContent = label; o.selected = v === current;
+      sel.append(o);
+    });
+    return sel;
+  }
 
   function renderWidgets() {
     editor.querySelectorAll(WIDGET_SEL).forEach(w => {
-      const all = w.classList.contains('papyru-children-all');
+      const toc = isToc(w);
+      const cls = widgetClass(w);
       const known = !!currentId && byId.has(currentId);
-      const items = [];
-      if (known) {
+      const items = [];   // {id|h, title, depth}
+      const search = cls === 'papyru-search';
+      const kw = search ? (w.dataset.kw || '') : '';
+      if (search) {
+        const terms = kw.toLowerCase().split(/[\s\u3000]+/).filter(Boolean);
+        if (terms.length) {
+          docs.filter(d => d.id !== currentId && terms.every(t => d.title.toLowerCase().includes(t)))
+            .sort(byTitle).forEach(d => items.push({ id: d.id, title: d.title, depth: 0, status: d.status || '' }));
+        }
+      } else if (toc) {
+        const hs = headingList(tocMax(w));
+        const base = hs.length ? Math.min(...hs.map(h => +h.tagName[1])) : 1;
+        // 最初の見出しが h2 でも、いちばん上の階層に見えるように、使われている最小の見出しを基準にする
+        const all = headingList(3);
+        hs.forEach(h => items.push({ h: all.indexOf(h), title: h.textContent.trim().replace(/\s+/g, ' '), depth: +h.tagName[1] - base }));
+      } else if (known) {
+        const all = cls === 'papyru-children-all';
         const walk = (pid, depth) => {
           for (const k of kids.get(pid) || []) {
-            items.push({ id: k.id, title: k.title, depth });
+            items.push({ id: k.id, title: k.title, depth, status: k.status || '' });
             if (all && depth < 20) walk(k.id, depth + 1);
           }
         };
         walk(currentId, 0);
       }
-      const sig = [all, known, items.map(i => i.depth + ':' + i.id + ':' + i.title).join('|')].join('#');
+      const sig = [cls, known, kw, items.map(i => i.depth + ':' + (i.id || i.h) + ':' + i.title + ':' + (i.status || '')).join('|')].join('#');
       if (w.dataset.sig === sig) return;   // 変わっていなければ作り直さない
       w.dataset.sig = sig;
       w.contentEditable = 'false';
+      const oldKw = w.querySelector('.pc-kw');
+      const kwFocus = oldKw && document.activeElement === oldKw ? oldKw.selectionStart : -1;
       w.replaceChildren();
 
       const head = document.createElement('div');
       head.className = 'pc-head';
       const t = document.createElement('span');
-      t.textContent = '子ページ一覧';
+      t.textContent = search ? 'キーワード一覧' : toc ? '目次' : '子ページ一覧';
       const ctl = document.createElement('span');
       ctl.className = 'pc-ctl edit-only';
-      const sel = document.createElement('select');
-      sel.className = 'pc-kind';
-      sel.title = '表示する範囲';
-      [['direct', '直下のみ'], ['all', 'すべての子孫']].forEach(([v, label]) => {
-        const o = document.createElement('option');
-        o.value = v; o.textContent = label; o.selected = (v === 'all') === all;
-        sel.append(o);
-      });
+      const sel = search ? null : toc
+        ? selectEl('pc-level', '目次に入れる見出しの範囲',
+            [['papyru-toc', '見出し1〜3'], ['papyru-toc-2', '見出し1〜2'], ['papyru-toc-1', '見出し1のみ']], cls)
+        : selectEl('pc-kind', '表示する範囲',
+            [['papyru-children', '直下のみ'], ['papyru-children-all', 'すべての子孫']], cls);
       const del = document.createElement('button');
       del.className = 'pc-del';
       del.type = 'button';
       del.textContent = '✕ 削除';
-      del.title = 'この一覧を本文から取り除く';
-      ctl.append(sel, del);
+      del.title = 'これを本文から取り除く';
+      if (search) {
+        const inp = document.createElement('input');
+        inp.type = 'text'; inp.className = 'pc-kw'; inp.value = kw;
+        inp.placeholder = 'キーワード（空白区切りでAND）'; inp.title = 'タイトルにこの語を含むページを表示';
+        ctl.append(inp, del);
+      } else ctl.append(sel, del);
       head.append(t, ctl);
+      if (search && kw) {
+        const lab = document.createElement('span');
+        lab.className = 'view-only'; lab.style.fontWeight = 'normal';
+        lab.textContent = '「' + kw + '」';
+        t.after(lab);
+      }
       w.append(head);
 
       if (!items.length) {
         const m = document.createElement('div');
         m.className = 'pc-empty';
-        m.textContent = known ? '（子ページはありません）' : '（保存すると、このページの子ページがここに表示されます）';
+        m.textContent = search ? (kw ? '（「' + kw + '」を含むページはありません）' : '（キーワードを入力すると、タイトルに含むページが一覧されます）')
+          : toc ? '（見出しがありません。見出し1〜3を設定すると、ここに目次が表示されます）'
+          : known ? '（子ページはありません）' : '（保存すると、このページの子ページがここに表示されます）';
         w.append(m);
       }
       items.forEach(it => {
@@ -1882,22 +2503,34 @@ PAGE = <<~'HTML'
         row.style.paddingLeft = (it.depth * 1.4) + 'em';
         const b = document.createElement('span');
         b.className = 'pc-item';
-        b.dataset.id = it.id;
+        if (toc && !search) b.dataset.h = it.h; else b.dataset.id = it.id;
         b.tabIndex = 0;
         b.setAttribute('role', 'link');
         b.textContent = it.title;
+        const wb = statusBadge(it.status);
+        if (wb) b.append(wb);
         row.append(b);
         w.append(row);
       });
+      if (kwFocus >= 0) { const ni = w.querySelector('.pc-kw'); if (ni) { ni.focus(); ni.setSelectionRange(kwFocus, kwFocus); } }
     });
   }
 
-  function insertChildrenWidget() {
+  // 目次の項目：対応する見出しまでスクロールする
+  function gotoHeading(item) {
+    const h = headingList(3)[+item.dataset.h];
+    if (!h) return;
+    h.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+  const openItem = item => { if (item.dataset.h !== undefined) gotoHeading(item); else load(item.dataset.id); };
+
+  function insertWidget(cls, kw) {
     const s = getSelection();
     let top = s.rangeCount && editor.contains(s.anchorNode) ? s.anchorNode : null;
     while (top && top.parentNode !== editor) top = top.parentNode;
     const w = document.createElement('div');
-    w.className = 'papyru-children';
+    w.className = cls;
+    if (kw !== undefined) w.dataset.kw = kw;
     const p = document.createElement('p');
     p.append(document.createElement('br'));
     if (!top) editor.append(w, p);
@@ -1912,11 +2545,25 @@ PAGE = <<~'HTML'
     editor.dispatchEvent(new Event('input'));
     editor.focus();
   }
-  $('childrenBtn').addEventListener('mousedown', e => { e.preventDefault(); insertChildrenWidget(); });
+  $('childrenBtn').addEventListener('mousedown', e => { e.preventDefault(); insertWidget('papyru-children'); });
+  $('searchBtn').addEventListener('mousedown', e => {
+    e.preventDefault();
+    const s = getSelection();
+    const def = s.rangeCount && editor.contains(s.anchorNode) ? s.toString().trim() : '';
+    const kw = prompt('タイトルに含まれるキーワード（空白区切りで複数指定するとAND）', def);
+    if (kw === null) return;
+    insertWidget('papyru-search', kw.trim());
+  });
+  // キーワード欄：入力に合わせて一覧をその場で絞り込む
+  editor.addEventListener('input', e => {
+    const t = e.target;
+    if (t.classList && t.classList.contains('pc-kw') && mode === 'edit') t.closest(WIDGET_SEL).dataset.kw = t.value;
+  }, true);
+  $('tocBtn').addEventListener('mousedown', e => { e.preventDefault(); insertWidget('papyru-toc'); });
 
   editor.addEventListener('click', e => {
     const item = e.target.closest && e.target.closest('.pc-item');
-    if (item) { e.preventDefault(); load(item.dataset.id); return; }
+    if (item) { e.preventDefault(); openItem(item); return; }
     const del = e.target.closest && e.target.closest('.pc-del');
     if (del && mode === 'edit') {
       del.closest(WIDGET_SEL).remove();
@@ -1925,12 +2572,12 @@ PAGE = <<~'HTML'
   });
   editor.addEventListener('keydown', e => {
     const item = e.target.closest && e.target.closest('.pc-item');
-    if (item && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); load(item.dataset.id); }
+    if (item && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); openItem(item); }
   });
   editor.addEventListener('change', e => {
-    if (!e.target.classList || !e.target.classList.contains('pc-kind') || mode !== 'edit') return;
-    const w = e.target.closest(WIDGET_SEL);
-    w.className = e.target.value === 'all' ? 'papyru-children-all' : 'papyru-children';
+    const t = e.target;
+    if (!t.classList || mode !== 'edit' || !(t.classList.contains('pc-kind') || t.classList.contains('pc-level'))) return;
+    t.closest(WIDGET_SEL).className = t.value;
     editor.dispatchEvent(new Event('input'));
   });
 
@@ -2082,7 +2729,8 @@ PAGE = <<~'HTML'
     const sel = getSelection();
     if (!sel.rangeCount || !editor.contains(sel.anchorNode)) return;
     const a = sel.anchorNode.nodeType === 3 ? sel.anchorNode.parentNode : sel.anchorNode;
-    if (a.closest('pre')) { if (dir > 0) document.execCommand('insertText', false, '\t'); return; }
+    const preEl = a.closest('pre');
+    if (preEl && editor.contains(preEl)) { codeIndent(preEl, dir); return; }
 
     const sv = { an: sel.anchorNode, ao: sel.anchorOffset, fn: sel.focusNode, fo: sel.focusOffset };
     const restore = () => {
@@ -2142,6 +2790,7 @@ PAGE = <<~'HTML'
   const onMouseDown = (el, fn) => el.addEventListener('mousedown', e => { e.preventDefault(); fn(); });
   onMouseDown($('pagelink'), openPicker);
   onMouseDown($('unlinkBtn'), unlinkSelection);
+  onMouseDown($('wikipediaBtn'), insertWikipediaLink);
   onMouseDown($('popopen'), () => { if (popAnchor) openLink(popAnchor); });
   onMouseDown($('popremove'), () => {
     if (!popAnchor) return;
@@ -2294,17 +2943,20 @@ def dispatch(cgi)
   when 'login'    then handle_login(cgi)
   when 'callback' then handle_callback(cgi)
   when 'logout'   then handle_logout(cgi)
-  when 'list', 'load', 'save', 'move', 'delete', 'history', 'revision'
+  when 'list', 'load', 'save', 'move', 'status', 'delete', 'history', 'revision', 'upload', 'image'
     email = current_email(cgi)
-    return send_json(cgi, { ok: false, error: 'login required' }, 'UNAUTHORIZED') unless email
+    return send_json(cgi, { ok: false, error: 'login required' }, 'AUTH_REQUIRED') unless email
 
     case action
     when 'list'     then handle_list(cgi)
     when 'load'     then handle_load(cgi)
     when 'move'     then handle_move(cgi)
+    when 'status'   then handle_status(cgi)
     when 'delete'   then handle_delete(cgi)
     when 'history'  then handle_history(cgi)
     when 'revision' then handle_revision(cgi)
+    when 'upload'   then handle_upload(cgi)
+    when 'image'    then handle_image(cgi)
     else                 handle_save(cgi, email)
     end
   else
@@ -2338,9 +2990,9 @@ begin
   end
   dispatch(CGI.new)
 rescue StandardError => e
-  warn "[papyru] #{e.class}: #{e.message}"
+  warn "[wiki] #{e.class}: #{e.message}"
   begin
-    send_html(CGI.new, html_message('エラーが発生しました', '時間をおいて再度お試しください。'), 'INTERNAL_SERVER_ERROR')
+    send_html(CGI.new, html_message('エラーが発生しました', '時間をおいて再度お試しください。'), 'SERVER_ERROR')
   rescue StandardError
     nil
   end
